@@ -75,6 +75,15 @@ pub struct Config {
     no_build_target: bool,
     verbose_cmake: bool,
     verbose_make: bool,
+    verbose_self: bool,
+}
+
+macro_rules! verbose {
+    ($var:expr, $($t:expr),*) => {
+        if $var.verbose_self {
+            eprintln!($($t),*);
+        }
+    };
 }
 
 /// Builds the native library rooted at `path` with the default cmake options.
@@ -121,6 +130,7 @@ impl Config {
             no_build_target: false,
             verbose_cmake: false,
             verbose_make: false,
+            verbose_self: false,
         }
     }
 
@@ -267,6 +277,7 @@ impl Config {
     pub fn very_verbose(&mut self, value: bool) -> &mut Config {
         self.verbose_cmake = value;
         self.verbose_make = value;
+        self.verbose_self = value;
         self
     }
 
@@ -277,9 +288,13 @@ impl Config {
     /// command to build the library.
     pub fn build(&mut self) -> PathBuf {
         let target = match self.target.clone() {
-            Some(t) => t,
+            Some(t) => {
+                verbose!(self, "user specified target: {}", t);
+                t
+            },
             None => {
                 let mut t = getenv_unwrap("TARGET");
+                verbose!(self, "environment target: {}", t);
                 if t.ends_with("-darwin") && self.uses_cxx11 {
                     t = t + "11"
                 }
@@ -289,6 +304,7 @@ impl Config {
         let host = self.host.clone().unwrap_or_else(|| {
             getenv_unwrap("HOST")
         });
+        verbose!(self, "host is: {}", host);
         let msvc = target.contains("msvc");
         let mut c_cfg = cc::Build::new();
         c_cfg.cargo_metadata(false)
@@ -312,12 +328,18 @@ impl Config {
         let c_compiler = c_cfg.get_compiler();
         let cxx_compiler = cxx_cfg.get_compiler();
 
+        verbose!(self, "detected C compiler: {:?}", c_compiler);
+        verbose!(self, "detected CXX compiler: {:?}", cxx_compiler);
+
         let dst = self.out_dir.clone().unwrap_or_else(|| {
             PathBuf::from(getenv_unwrap("OUT_DIR"))
         });
         let build = dst.join("build");
         self.maybe_clear(&build);
         let _ = fs::create_dir(&build);
+
+        verbose!(self, "OUT_DIR: {:?}", dst);
+        verbose!(self, "BUILD_DIR: {:?}", build);
 
         // Add all our dependencies to our cmake paths
         let mut cmake_prefix_path = Vec::new();
@@ -332,6 +354,8 @@ impl Config {
         cmake_prefix_path.extend(env::split_paths(&system_prefix)
                                      .map(|s| s.to_owned()));
         let cmake_prefix_path = env::join_paths(&cmake_prefix_path).unwrap();
+
+        verbose!(self, "CMAKE_PREFIX_PATH: {:?}", cmake_prefix_path);
 
         // Build up the first cmake command to build the build system.
         let executable = env::var("CMAKE").unwrap_or("cmake".to_owned());
@@ -364,6 +388,8 @@ impl Config {
                         (false, false) => fail("no valid generator found for GNU toolchain; MSYS or MinGW must be installed")
                     };
 
+                    verbose!(self, "generator: {:?}", generator);
+
                     cmd.arg("-G").arg(generator);
                 }
             } else {
@@ -392,7 +418,10 @@ impl Config {
             // otherwise we won't get 32/64 bit correct automatically.
             // This also guarantees that NMake generator isn't chosen implicitly.
             if self.generator.is_none() {
+                verbose!(self, "generator: {:?}", self.visual_studio_generator(&target));
                 cmd.arg("-G").arg(self.visual_studio_generator(&target));
+            } else {
+                verbose!(self, "generator: {:?}", self.generator);
             }
         } else if target.contains("redox") {
             if !self.defined("CMAKE_SYSTEM_NAME") {
@@ -405,6 +434,7 @@ impl Config {
         }
         let mut is_ninja = false;
         if let Some(ref generator) = self.generator {
+            verbose!(self, "generator: {:?}", generator);
             cmd.arg("-G").arg(generator);
             is_ninja = generator.to_string_lossy().contains("Ninja");
         }
@@ -473,23 +503,28 @@ impl Config {
                 (OptLevel::Size, _) => "MinSizeRel",
             }.to_string()
         });
+        verbose!(self, "profile: {:?}", profile);
+
         for &(ref k, ref v) in &self.defines {
             let mut os = OsString::from("-D");
             os.push(k);
             os.push("=");
             os.push(v);
+            verbose!(self, "define: {:?}", os);
             cmd.arg(os);
         }
 
         if !self.defined("CMAKE_INSTALL_PREFIX") {
             let mut dstflag = OsString::from("-DCMAKE_INSTALL_PREFIX=");
             dstflag.push(&dst);
+            verbose!(self, "define: {:?}", dstflag);
             cmd.arg(dstflag);
         }
 
         let build_type = self.defines.iter().find(|&&(ref a, _)| {
             a == "CMAKE_BUILD_TYPE"
         }).map(|x| x.1.to_str().unwrap()).unwrap_or(&profile);
+        verbose!(self, "build type: {:?}", build_type);
         let build_type_upcase = build_type.chars()
                                           .flat_map(|c| c.to_uppercase())
                                           .collect::<String>();
@@ -521,6 +556,7 @@ impl Config {
                         flagsflag.push(" ");
                         flagsflag.push(arg);
                     }
+                    verbose!(self, "compiler flags: {:?}", flagsflag);
                     cmd.arg(flagsflag);
                 }
 
@@ -546,6 +582,7 @@ impl Config {
                             flagsflag.push(" ");
                             flagsflag.push(arg);
                         }
+                        verbose!(self, "compiler flags: {:?}", flagsflag);
                         cmd.arg(flagsflag);
                     }
                 }
@@ -576,6 +613,7 @@ impl Config {
                         }).collect::<Vec<_>>();
                         ccompiler = OsString::from_wide(&wchars);
                     }
+                       verbose!(self, "compiler: {:?}", compiler);
                     cmd.arg(ccompiler);
                 }
             };
@@ -599,6 +637,7 @@ impl Config {
         }
 
         for &(ref k, ref v) in c_compiler.env().iter().chain(&self.env) {
+            verbose!(self, "environment: {:?}={:?}", k, v);
             cmd.env(k, v);
         }
 
@@ -647,6 +686,7 @@ impl Config {
         let target = self.cmake_target.clone().unwrap_or("install".to_string());
         let mut cmd = Command::new("cmake");
         for &(ref k, ref v) in c_compiler.env().iter().chain(&self.env) {
+            verbose!(self, "environment: {:?}={:?}", k, v);
             cmd.env(k, v);
         }
         if let Some(flags) = makeflags {
